@@ -10,10 +10,19 @@ equals the minimum.  A station whose predicted amplitude is zero (nodal)
 always counts as a misfit.
 
 Mechanisms that differ only by swapping the two nodal planes are the same
-double couple; duplicates are removed via a canonical moment-tensor key, and
-each surviving solution reports both nodal planes, its misfit weight and the
-per-station observed/predicted polarities.  Tied best solutions are presented
-in a stable (strike, dip, rake) order with keyset pagination.
+double couple; duplicates are removed via a canonical moment-tensor key that is
+invariant under the plane swap but *not* under a global sign flip: ``M`` and
+``-M`` predict opposite first-motion polarities, so both stay in the search and
+compete on equal footing.  Each surviving solution reports both nodal planes,
+its misfit weight and the per-station observed/predicted polarities.  Tied best
+solutions are presented in a stable (strike, dip, rake) order with keyset
+pagination.
+
+Reports persisted by the earlier (sign-merging) rule carry schema version 1 and
+are repaired lazily, idempotently and concurrently: the first repeat POST or
+report/solution GET recomputes the full corrected solution set in place, keeps
+the same inversion id and bumps the schema version, so legacy reports and
+reports created under the current rule return the same content everywhere.
 
 Requests are validated explicitly: every pick must be an associated P pick of
 the event, one polarity per station (contradictions are rejected), at least
@@ -60,6 +69,15 @@ NODAL_EPS = 1e-6
 
 DEFAULT_PAGE_LIMIT = 50
 MAX_PAGE_LIMIT = 200
+
+# Schema version stamped on persisted inversion reports:
+#   1 -- legacy: the dedup key canonicalized the sign of the moment tensor, so
+#        M and -M (opposite predicted polarities) were merged, dropping
+#        candidates and corrupting tied sets/misfit weights.
+#   2 -- current: only nodal-plane swaps share a key; M and -M are distinct
+#        candidates over the full grid, zero amplitudes still count as misfits.
+SCHEMA_VERSION_LEGACY = 1
+SCHEMA_VERSION_CURRENT = 2
 
 _SIGN_LABEL = {1: "positive", -1: "negative", 0: "nodal"}
 
@@ -189,37 +207,35 @@ def _predicted_sign(amplitude: float) -> int:
 
 
 def mechanism_key(strike_deg: float, dip_deg: float, rake_deg: float) -> tuple:
-    """Canonical double-couple key, invariant under nodal-plane swap.
+    """Canonical double-couple key, invariant under nodal-plane swap only.
 
     The symmetric moment tensor ``u n^T + n u^T`` is identical for the two
-    nodal-plane representations of one mechanism (and for the sign-flipped
-    pair), so a normalized, sign-canonicalized, rounded copy of it dedupes
-    equivalent grid solutions.
+    nodal-plane representations of one mechanism, so a normalized, rounded copy
+    of it dedupes swapped grid solutions.  The overall sign is deliberately
+    *not* canonicalized: ``-M`` is produced by the rake-shifted twin on the
+    grid and radiates the opposite P first-motion pattern, hence it is a
+    different candidate with its own misfit and must never be merged with
+    ``M``.
     """
     normal, slip = fault_vectors(strike_deg, dip_deg, rake_deg)
     return _key_from_vectors(normal, slip)
 
 
 def _key_from_vectors(normal, slip) -> tuple:
-    n, u = normal, slip
     m = [
-        2.0 * n[0] * u[0],
-        2.0 * n[1] * u[1],
-        2.0 * n[2] * u[2],
-        n[0] * u[1] + n[1] * u[0],
-        n[0] * u[2] + n[2] * u[0],
-        n[1] * u[2] + n[2] * u[1],
+        2.0 * normal[0] * slip[0],
+        2.0 * normal[1] * slip[1],
+        2.0 * normal[2] * slip[2],
+        normal[0] * slip[1] + normal[1] * slip[0],
+        normal[0] * slip[2] + normal[2] * slip[0],
+        normal[1] * slip[2] + normal[2] * slip[1],
     ]
+    # Scale normalization makes the swap-equivalent representations identical;
+    # the sign is preserved on purpose so M and -M get distinct keys.
     scale = max(abs(c) for c in m)
     if scale <= 0.0:  # pragma: no cover - a unit couple never vanishes
         scale = 1.0
-    m = [c / scale for c in m]
-    for c in m:
-        if abs(c) > 1e-9:
-            if c < 0.0:
-                m = [-x for x in m]
-            break
-    return tuple(round(c, 6) for c in m)
+    return tuple(round(c / scale, 6) for c in m)
 
 
 # --------------------------------------------------------------------------- #
@@ -342,12 +358,7 @@ def create_inversion(db: Session, req: FocalMechanismCreate) -> tuple[dict, bool
     coords = {w.station: (w.latitude, w.longitude, w.elevation_m) for w in waveforms}
     layers = canonical_layers(model_row.layers)
     model = LayeredModel.from_dicts(layers)
-    geometry = {}
-    for station in stations:
-        lat, lon, elev = coords[station]
-        geometry[station] = ray_geometry(
-            model, event.latitude, event.longitude, event.depth_km, lat, lon, elev
-        )
+    geometry = _station_geometry(model, event, coords, stations)
     gap = _max_azimuthal_gap([geometry[s][0] for s in stations])
     if gap >= MAX_AZIMUTHAL_GAP_DEG:
         raise ApiError(
@@ -357,7 +368,84 @@ def create_inversion(db: Session, req: FocalMechanismCreate) -> tuple[dict, bool
             f"{MAX_AZIMUTHAL_GAP_DEG:.0f} deg",
         )
 
-    canon_request = {
+    canon_request = _canonical_request(event, model_row, stations, polarities)
+    request_hash = hashlib.sha256(
+        json.dumps(canon_request, sort_keys=True).encode()
+    ).hexdigest()
+    existing = (
+        db.query(FocalMechanismInversion)
+        .filter_by(request_hash=request_hash)
+        .one_or_none()
+    )
+    if existing is not None:
+        # Repeat of a legacy (sign-merging) request: repair the stored report
+        # in place before serving, so replayers get the corrected report under
+        # the same inversion id.
+        existing = ensure_current_schema(db, existing)
+        db.commit()
+        return inversion_payload(db, existing, created=False), False
+
+    ray_vectors = {s: _ray_vector(*geometry[s]) for s in stations}
+    min_misfit, tied = grid_search(ray_vectors, polarities)
+
+    frozen = _build_frozen(
+        model_row, layers, event, coords, stations, geometry, polarities, pick_ids, gap
+    )
+    inversion = FocalMechanismInversion(
+        request_hash=request_hash,
+        request=canon_request,
+        event_id=event.id,
+        run_id=run.id,
+        frozen=frozen,
+        grid_step_deg=GRID_STEP_DEG,
+        station_count=len(stations),
+        solution_count=len(tied),
+        min_misfit_weight=round(min_misfit, 6),
+        schema_version=SCHEMA_VERSION_CURRENT,
+    )
+    db.add(inversion)
+    try:
+        db.flush()
+    except IntegrityError:
+        # Concurrent identical request: collapse onto the surviving inversion.
+        db.rollback()
+        winner = (
+            db.query(FocalMechanismInversion)
+            .filter_by(request_hash=request_hash)
+            .one()
+        )
+        winner = ensure_current_schema(db, winner)
+        db.commit()
+        return inversion_payload(db, winner, created=False), False
+
+    _persist_solutions(db, inversion.id, tied, geometry, polarities, pick_ids)
+    db.commit()
+    db.refresh(inversion)
+    return inversion_payload(db, inversion, created=True), True
+
+
+def _station_geometry(
+    model: LayeredModel,
+    event: Event,
+    coords: dict[str, tuple[float, float, float]],
+    stations: list[str],
+) -> dict[str, tuple[float, float]]:
+    geometry = {}
+    for station in stations:
+        lat, lon, elev = coords[station]
+        geometry[station] = ray_geometry(
+            model, event.latitude, event.longitude, event.depth_km, lat, lon, elev
+        )
+    return geometry
+
+
+def _canonical_request(
+    event: Event,
+    model_row: VelocityModel,
+    stations: list[str],
+    polarities: dict[str, tuple[int, float]],
+) -> dict:
+    return {
         "event_id": event.id,
         "model": {"name": model_row.name, "version": model_row.version},
         "polarities": [
@@ -369,22 +457,20 @@ def create_inversion(db: Session, req: FocalMechanismCreate) -> tuple[dict, bool
             for s in stations
         ],
     }
-    request_hash = hashlib.sha256(
-        json.dumps(canon_request, sort_keys=True).encode()
-    ).hexdigest()
-    existing = (
-        db.query(FocalMechanismInversion)
-        .filter_by(request_hash=request_hash)
-        .one_or_none()
-    )
-    if existing is not None:
-        db.commit()
-        return inversion_payload(db, existing, created=False), False
 
-    ray_vectors = {s: _ray_vector(*geometry[s]) for s in stations}
-    min_misfit, tied = grid_search(ray_vectors, polarities)
 
-    frozen = {
+def _build_frozen(
+    model_row: VelocityModel,
+    layers: list[dict],
+    event: Event,
+    coords: dict[str, tuple[float, float, float]],
+    stations: list[str],
+    geometry: dict[str, tuple[float, float]],
+    polarities: dict[str, tuple[int, float]],
+    pick_ids: dict[str, str],
+    gap: float,
+) -> dict:
+    return {
         "model": {"name": model_row.name, "version": model_row.version,
                   "layers": layers},
         "hypocenter": {
@@ -415,34 +501,20 @@ def create_inversion(db: Session, req: FocalMechanismCreate) -> tuple[dict, bool
         ],
         "azimuthal_gap_deg": round(gap, 2),
     }
-    inversion = FocalMechanismInversion(
-        request_hash=request_hash,
-        request=canon_request,
-        event_id=event.id,
-        run_id=run.id,
-        frozen=frozen,
-        grid_step_deg=GRID_STEP_DEG,
-        station_count=len(stations),
-        solution_count=len(tied),
-        min_misfit_weight=round(min_misfit, 6),
-    )
-    db.add(inversion)
-    try:
-        db.flush()
-    except IntegrityError:
-        # Concurrent identical request: collapse onto the surviving inversion.
-        db.rollback()
-        winner = (
-            db.query(FocalMechanismInversion)
-            .filter_by(request_hash=request_hash)
-            .one()
-        )
-        return inversion_payload(db, winner, created=False), False
 
+
+def _persist_solutions(
+    db: Session,
+    inversion_id: str,
+    tied: list[tuple[int, int, int, float, int]],
+    geometry: dict[str, tuple[float, float]],
+    polarities: dict[str, tuple[int, float]],
+    pick_ids: dict[str, str],
+) -> None:
     for idx, (strike, dip, rake, misfit, mismatches) in enumerate(tied):
         db.add(
             FocalMechanismSolution(
-                inversion_id=inversion.id,
+                inversion_id=inversion_id,
                 sort_index=idx,
                 misfit_weight=round(misfit, 6),
                 misfit_count=mismatches,
@@ -452,9 +524,6 @@ def create_inversion(db: Session, req: FocalMechanismCreate) -> tuple[dict, bool
                 ),
             )
         )
-    db.commit()
-    db.refresh(inversion)
-    return inversion_payload(db, inversion, created=True), True
 
 
 def _normalize_observations(
@@ -507,6 +576,109 @@ def _normalize_observations(
 
 
 # --------------------------------------------------------------------------- #
+# lazy in-place repair of legacy (schema version 1) inversion reports
+# --------------------------------------------------------------------------- #
+def ensure_current_schema(
+    db: Session, inversion: FocalMechanismInversion
+) -> FocalMechanismInversion:
+    """Return the inversion under the current dedup rule, repairing it once.
+
+    Legacy reports were stored with a moment-tensor key that merged ``M`` and
+    ``-M``; they are recomputed in place (same id, request hash, frozen context
+    and timestamps) with the current full candidate set.  The repair is
+    idempotent (v2 rows are returned untouched) and concurrency-safe (the row
+    is taken with ``FOR UPDATE``; concurrent callers block, then observe the
+    already-current version and do nothing).  Only the inversion's own rows are
+    touched: events, runs, picks and catalog content stay byte-for-byte intact.
+    """
+    if inversion.schema_version is not None and inversion.schema_version >= (
+        SCHEMA_VERSION_CURRENT
+    ):
+        return inversion
+
+    # Re-read under a row lock so two simultaneous repairs serialize.  SQLite
+    # serializes writers natively and treats FOR UPDATE as a no-op.
+    locked = (
+        db.query(FocalMechanismInversion)
+        .filter_by(id=inversion.id)
+        .with_for_update()
+        .one_or_none()
+    )
+    if locked is None:  # pragma: no cover - the row existed moments ago
+        raise ApiError(
+            404,
+            "focal_mechanism_not_found",
+            f"focal mechanism inversion {inversion.id} not found",
+        )
+    if locked.schema_version is not None and locked.schema_version >= (
+        SCHEMA_VERSION_CURRENT
+    ):
+        # Another request won the race and already repaired this report.
+        db.rollback()
+        return db.get(FocalMechanismInversion, locked.id)
+
+    repaired = _repair_legacy_inversion(db, locked)
+    db.commit()
+    return db.get(FocalMechanismInversion, repaired.id)
+
+
+def _repair_legacy_inversion(
+    db: Session, inversion: FocalMechanismInversion
+) -> FocalMechanismInversion:
+    """Recompute one legacy report's solutions from its immutable inputs.
+
+    Source data (event/run/waveforms/velocity model) is read fresh, so the
+    recomputed geometry matches what a brand-new inversion produces; the
+    normalized polarity set and per-station pick ids come from the stored
+    request/frozen snapshot that define the idempotency key.
+    """
+    event = db.get(Event, inversion.event_id)
+    if event is None:  # pragma: no cover - events are immutable and retained
+        raise ApiError(
+            404, "event_not_found", f"event {inversion.event_id} not found"
+        )
+    run = db.get(Run, inversion.run_id)
+    if run is None:  # pragma: no cover - FK integrity
+        raise ApiError(404, "run_not_found", f"run {inversion.run_id} not found")
+    model_row = db.get(VelocityModel, run.model_id)
+    if model_row is None:  # pragma: no cover - immutable models are retained
+        raise ApiError(404, "model_not_found", "the inversion's velocity model is gone")
+
+    stations = sorted(p["station"] for p in inversion.request["polarities"])
+    polarities: dict[str, tuple[int, float]] = {}
+    for entry in inversion.request["polarities"]:
+        polarities[entry["station"]] = (
+            1 if entry["polarity"] == "positive" else -1,
+            float(entry["weight"]),
+        )
+    pick_ids = {p["station"]: p["pick_id"] for p in inversion.frozen["polarities"]}
+
+    waveforms = db.query(Waveform).filter_by(ingestion_id=run.ingestion_id).all()
+    coords = {w.station: (w.latitude, w.longitude, w.elevation_m) for w in waveforms}
+    layers = canonical_layers(model_row.layers)
+    model = LayeredModel.from_dicts(layers)
+    geometry = _station_geometry(model, event, coords, stations)
+
+    ray_vectors = {s: _ray_vector(*geometry[s]) for s in stations}
+    min_misfit, tied = grid_search(ray_vectors, polarities)
+
+    # Replace the (sign-merged) solution rows inside the same locked
+    # transaction; delete + flush before insert keeps the unique
+    # (inversion_id, sort_index) constraint satisfied throughout.
+    db.query(FocalMechanismSolution).filter_by(inversion_id=inversion.id).delete(
+        synchronize_session=False
+    )
+    db.flush()
+    _persist_solutions(db, inversion.id, tied, geometry, polarities, pick_ids)
+
+    inversion.solution_count = len(tied)
+    inversion.min_misfit_weight = round(min_misfit, 6)
+    inversion.schema_version = SCHEMA_VERSION_CURRENT
+    db.flush()
+    return inversion
+
+
+# --------------------------------------------------------------------------- #
 # queries
 # --------------------------------------------------------------------------- #
 def get_inversion(db: Session, inversion_id: str) -> dict:
@@ -517,6 +689,8 @@ def get_inversion(db: Session, inversion_id: str) -> dict:
             "focal_mechanism_not_found",
             f"focal mechanism inversion {inversion_id} not found",
         )
+    row = ensure_current_schema(db, row)
+    db.commit()
     return inversion_payload(db, row, created=False)
 
 
@@ -552,7 +726,11 @@ def list_inversions(
     q = q.order_by(FocalMechanismInversion.created_at, FocalMechanismInversion.id)
     rows = q.limit(limit + 1).all()
 
-    page = rows[:limit]
+    # Legacy rows on the page are repaired (once, in place) before their
+    # summaries are serialized, so list and detail always agree.
+    page = [ensure_current_schema(db, r) for r in rows[:limit]]
+    db.commit()
+
     next_cursor = None
     if len(rows) > limit:
         last = page[-1]
@@ -573,6 +751,8 @@ def list_solutions(
             "focal_mechanism_not_found",
             f"focal mechanism inversion {inversion_id} not found",
         )
+    inversion = ensure_current_schema(db, inversion)
+    db.commit()
     rows, next_cursor = _solutions_page(db, inversion, limit, cursor)
     return {
         "inversion_id": inversion.id,
@@ -683,6 +863,7 @@ def inversion_summary(row: FocalMechanismInversion) -> dict:
         "station_count": row.station_count,
         "solution_count": row.solution_count,
         "min_misfit_weight": round(row.min_misfit_weight, 6),
+        "schema_version": row.schema_version,
         "created_at": iso_z(row.created_at),
     }
 
@@ -705,6 +886,7 @@ def inversion_payload(
         "station_count": inversion.station_count,
         "solution_count": inversion.solution_count,
         "min_misfit_weight": round(inversion.min_misfit_weight, 6),
+        "schema_version": inversion.schema_version,
         "solutions": [solution_payload(r) for r in rows],
         "next_cursor": next_cursor,
         "created_at": iso_z(inversion.created_at),

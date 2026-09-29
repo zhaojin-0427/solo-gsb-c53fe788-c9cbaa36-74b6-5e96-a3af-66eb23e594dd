@@ -8,13 +8,14 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from .api.routes import router
-from .database import Base, SessionLocal, engine
+from .database import Base, SessionLocal, engine, run_migrations
 from .services.pipeline import ApiError, seed_default_model
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
+    run_migrations()
     db = SessionLocal()
     try:
         seed_default_model(db)
@@ -44,7 +45,9 @@ app = FastAPI(
         "P-wave first-motion focal mechanism inversion grid-searches "
         "double-couple strike/dip/rake on a 10-degree grid for a completed "
         "event's associated P polarities, keeping every minimum-misfit "
-        "mechanism with plane-swap duplicates removed."
+        "mechanism with nodal-plane-swap duplicates removed (opposite "
+        "tensors M and -M stay distinct candidates); reports stored under "
+        "the earlier sign-merging rule are repaired lazily in place."
     ),
     lifespan=lifespan,
 )

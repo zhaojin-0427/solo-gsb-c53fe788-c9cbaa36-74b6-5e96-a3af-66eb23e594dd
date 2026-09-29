@@ -138,6 +138,64 @@ def test_mechanism_key_invariant_under_nodal_plane_swap():
     assert fm.mechanism_key(*aux) == fm.mechanism_key(30, 60, -90)
 
 
+def test_mechanism_key_distinguishes_opposite_tensors():
+    # M and -M radiate opposite P first motions; the rake+180 twin on the grid
+    # is exactly -M and must get a distinct key.
+    mech = (40.0, 60.0, -20.0)
+    twin = (40.0, 60.0, 160.0)  # same plane, opposite slip -> -M
+    assert fm.mechanism_key(*mech) != fm.mechanism_key(*twin)
+    # the old sign-canonicalization would have collapsed them
+    n, u = fm.fault_vectors(*mech)
+    assert fm._key_from_vectors(tuple(-c for c in n), tuple(-c for c in u)) == (
+        fm._key_from_vectors(n, u)  # both flipped = plane swap identity, unchanged
+    )
+    assert fm._key_from_vectors(n, tuple(-c for c in u)) == tuple(
+        -c for c in fm._key_from_vectors(n, u)
+    )
+
+
+def test_grid_search_keeps_both_signs_of_an_equivalent_class():
+    # Two stations sharing one ray direction with opposite observed polarities
+    # and equal weights: for every mechanism, misfit(M) + misfit(-M) = 2, so
+    # both signs of each class must be compared; ties contain both predictions.
+    direction = fm._ray_vector(45.0, 115.0)
+    rays = {"A": direction, "B": direction}
+    best, tied = fm.grid_search(rays, {"A": (1, 1.0), "B": (-1, 1.0)})
+    assert best == 1.0
+    assert tied
+    predictions = set()
+    for strike, dip, rake, misfit, count in tied:
+        assert misfit == 1.0 and count == 1
+        normal, slip = fm.fault_vectors(strike, dip, rake)
+        predictions.add(
+            fm._predicted_sign(fm.p_radiation(normal, slip, 45.0, 115.0))
+        )
+    assert predictions == {1, -1}, "M and -M candidates must both survive"
+
+
+def test_grid_search_recovers_twin_dropped_by_sign_merge_rule():
+    # Polarities consistent with a late-iterating mechanism whose -M twin is
+    # visited earlier; the sign-merging rule dropped the perfect-fit M.
+    obs_dirs = [
+        fm._ray_vector(az, to)
+        for az, to in [(10, 110), (60, 115), (120, 120), (190, 130),
+                       (250, 140), (310, 150)]
+    ]
+    mech = (350.0, 80.0, 170.0)
+    normal, slip = fm.fault_vectors(*mech)
+    rays = {f"S{i}": x for i, x in enumerate(obs_dirs)}
+    polarities = {
+        f"S{i}": (1 if fm._dot(x, normal) * fm._dot(x, slip) > 0 else -1, 1.0)
+        for i, x in enumerate(obs_dirs)
+    }
+    best, tied = fm.grid_search(rays, polarities)
+    assert best == 0.0
+    keys = {fm.mechanism_key(*t[:3]) for t in tied}
+    assert fm.mechanism_key(*mech) in keys
+    # the opposite tensor has misfit at every station and is not among the ties
+    assert fm.mechanism_key(350.0, 80.0, -10.0) not in keys
+
+
 def test_nodal_prediction_counts_as_misfit():
     # N-striking vertical strike-slip: azimuth 0 sits exactly on a nodal plane.
     normal, slip = fm.fault_vectors(0, 90, 0)
@@ -321,6 +379,243 @@ def test_concurrent_identical_inversions_collapse(client):
     statuses = sorted(s for s, _ in results)
     assert statuses == [200, 201], results
     assert results[0][1] == results[1][1]
+
+
+# --------------------------------------------------------------------------- #
+# lazy in-place repair of legacy (schema version 1) reports
+# --------------------------------------------------------------------------- #
+def _legacy_key_from_vectors(normal, slip):
+    """The pre-fix key: normalized AND sign-canonicalized moment tensor."""
+    n, u = normal, slip
+    m = [
+        2.0 * n[0] * u[0],
+        2.0 * n[1] * u[1],
+        2.0 * n[2] * u[2],
+        n[0] * u[1] + n[1] * u[0],
+        n[0] * u[2] + n[2] * u[0],
+        n[1] * u[2] + n[2] * u[1],
+    ]
+    scale = max(abs(c) for c in m)
+    m = [c / scale for c in m]
+    for c in m:
+        if abs(c) > 1e-9:
+            if c < 0.0:
+                m = [-x for x in m]
+            break
+    return tuple(round(c, 6) for c in m)
+
+
+def _downgrade_report_to_legacy(client, inversion_id):
+    """Rewrite one persisted v2 report with the old sign-merging solutions."""
+    import app.database as database
+    from app.models import (
+        FocalMechanismInversion,
+        FocalMechanismSolution,
+    )
+
+    db = database.SessionLocal()
+    try:
+        inversion = db.get(FocalMechanismInversion, inversion_id)
+        pol = {
+            p["station"]: (
+                1 if p["polarity"] == "positive" else -1,
+                float(
+                    next(
+                        q["weight"]
+                        for q in inversion.request["polarities"]
+                        if q["station"] == p["station"]
+                    )
+                ),
+            )
+            for p in inversion.frozen["polarities"]
+        }
+        pick_ids = {
+            p["station"]: p["pick_id"] for p in inversion.frozen["polarities"]
+        }
+        geometry = {
+            s["station"]: (s["azimuth_deg"], s["takeoff_deg"])
+            for s in inversion.frozen["stations"]
+        }
+        rays = {s: fm._ray_vector(*g) for s, g in geometry.items()}
+
+        seen, best, tied = set(), None, []
+        for strike in range(0, 360, 10):
+            for dip in range(10, 91, 10):
+                for rake in range(-180, 180, 10):
+                    normal, slip = fm.fault_vectors(strike, dip, rake)
+                    if _legacy_key_from_vectors(normal, slip) in seen:
+                        continue
+                    seen.add(_legacy_key_from_vectors(normal, slip))
+                    misfit, mismatches = 0.0, 0
+                    for station, x in rays.items():
+                        sign, weight = pol[station]
+                        if fm._predicted_sign(
+                            fm._dot(x, normal) * fm._dot(x, slip)
+                        ) != sign:
+                            misfit += weight
+                            mismatches += 1
+                    misfit_key = round(misfit, 6)
+                    if best is None or misfit_key < best:
+                        best, tied = misfit_key, [
+                            (strike, dip, rake, misfit, mismatches)
+                        ]
+                    elif misfit_key == best:
+                        tied.append((strike, dip, rake, misfit, mismatches))
+        tied.sort(key=lambda t: (t[0], t[1], t[2]))
+
+        db.query(FocalMechanismSolution).filter_by(
+            inversion_id=inversion.id
+        ).delete(synchronize_session=False)
+        db.flush()
+        for idx, (strike, dip, rake, misfit, mismatches) in enumerate(tied):
+            db.add(
+                FocalMechanismSolution(
+                    inversion_id=inversion.id,
+                    sort_index=idx,
+                    misfit_weight=round(misfit, 6),
+                    misfit_count=mismatches,
+                    detail=fm._solution_detail(
+                        strike, dip, rake, misfit, mismatches,
+                        geometry, pol, pick_ids,
+                    ),
+                )
+            )
+        inversion.solution_count = len(tied)
+        inversion.min_misfit_weight = round(best, 6)
+        inversion.schema_version = fm.SCHEMA_VERSION_LEGACY
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_legacy_report_get_repaired_on_id_query(client):
+    data, event, obs, first = _invert_known(client, prefix="LR")
+    assert first.status_code == 201
+    inversion_id = first.json()["inversion_id"]
+    current = first.json()
+    run_before = client.get(f"/v1/runs/{data['run_id']}").json()
+    event_before = client.get(f"/v1/events/{event['event_id']}").json()
+
+    _downgrade_report_to_legacy(client, inversion_id)
+
+    got = client.get(f"/v1/focal-mechanisms/{inversion_id}")
+    assert got.status_code == 200
+    repaired = got.json()
+    assert repaired["schema_version"] == fm.SCHEMA_VERSION_CURRENT
+    assert repaired["inversion_id"] == inversion_id
+    # the corrected report is exactly what a fresh current-rule run produces
+    assert repaired["solutions"] == current["solutions"]
+    assert repaired["solution_count"] == current["solution_count"]
+    assert repaired["min_misfit_weight"] == current["min_misfit_weight"]
+    # frozen context, idempotency key and timestamps are untouched
+    assert repaired["frozen"] == current["frozen"]
+    assert repaired["request"] == current["request"]
+    assert repaired["created_at"] == current["created_at"]
+    # repair writes only inversion tables: the event and the run are unchanged
+    assert client.get(f"/v1/runs/{data['run_id']}").json() == run_before
+    assert client.get(f"/v1/events/{event['event_id']}").json() == event_before
+
+
+def test_legacy_report_get_repaired_on_solutions_and_repeat_post(client):
+    _, event, obs, first = _invert_known(client, prefix="LP")
+    assert first.status_code == 201
+    inversion_id = first.json()["inversion_id"]
+    current_solutions = _all_solutions(client, inversion_id)
+
+    _downgrade_report_to_legacy(client, inversion_id)
+
+    # solutions endpoint repairs the report too
+    page = client.get(
+        f"/v1/focal-mechanisms/{inversion_id}/solutions", params={"limit": 5}
+    )
+    assert page.status_code == 200
+    assert page.json()["solution_count"] == len(current_solutions)
+    assert [s["solution_index"] for s in page.json()["solutions"]] == list(
+        range(5)
+    )
+
+    # repeat POST returns the same id and the corrected report (200)
+    repeat = _invert(client, event["event_id"], obs)
+    assert repeat.status_code == 200
+    assert repeat.json()["inversion_id"] == inversion_id
+    assert repeat.json()["schema_version"] == fm.SCHEMA_VERSION_CURRENT
+    assert (
+        repeat.json()["solution_count"]
+        == first.json()["solution_count"]
+    )
+    assert repeat.json()["solutions"] == first.json()["solutions"]
+    # GET by id then returns the very same corrected report
+    again = client.get(f"/v1/focal-mechanisms/{inversion_id}")
+    assert again.json()["solutions"] == repeat.json()["solutions"]
+    assert again.json()["created_at"] == repeat.json()["created_at"]
+
+    # list summary agrees with the repaired report
+    listed = client.get(
+        "/v1/focal-mechanisms", params={"event_id": event["event_id"]}
+    ).json()["inversions"]
+    summary = next(i for i in listed if i["inversion_id"] == inversion_id)
+    assert summary["schema_version"] == fm.SCHEMA_VERSION_CURRENT
+    assert summary["solution_count"] == first.json()["solution_count"]
+    assert summary["min_misfit_weight"] == first.json()["min_misfit_weight"]
+
+
+def test_legacy_repair_is_idempotent_and_keeps_repair_history(client):
+    _, event, obs, first = _invert_known(client, prefix="LI")
+    inversion_id = first.json()["inversion_id"]
+    _downgrade_report_to_legacy(client, inversion_id)
+
+    first_get = client.get(f"/v1/focal-mechanisms/{inversion_id}").json()
+    second_get = client.get(f"/v1/focal-mechanisms/{inversion_id}").json()
+    third_get = client.get(f"/v1/focal-mechanisms/{inversion_id}").json()
+    assert second_get == first_get
+    assert third_get == first_get
+
+    # one contiguous solution_index order after repair (stable pagination)
+    all_solutions = _all_solutions(client, inversion_id)
+    assert [s["solution_index"] for s in all_solutions] == list(
+        range(len(all_solutions))
+    )
+    order = [
+        (s["plane_1"]["strike_deg"], s["plane_1"]["dip_deg"],
+         s["plane_1"]["rake_deg"])
+        for s in all_solutions
+    ]
+    assert order == sorted(order)
+
+
+def test_concurrent_legacy_report_repairs_collapse(client):
+    _, event, obs, first = _invert_known(client, prefix="LC")
+    inversion_id = first.json()["inversion_id"]
+    _downgrade_report_to_legacy(client, inversion_id)
+
+    results = []
+    barrier = threading.Barrier(4)
+
+    def worker():
+        barrier.wait()
+        r = client.get(f"/v1/focal-mechanisms/{inversion_id}")
+        results.append(r)
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert all(r.status_code == 200 for r in results)
+    bodies = [r.json() for r in results]
+    assert all(b["inversion_id"] == inversion_id for b in bodies)
+    assert all(
+        b["schema_version"] == fm.SCHEMA_VERSION_CURRENT for b in bodies
+    )
+    assert all(b["solutions"] == bodies[0]["solutions"] for b in bodies)
+    # still exactly one inversion, with a contiguous solution order
+    assert (
+        client.get(
+            "/v1/focal-mechanisms", params={"event_id": event["event_id"]}
+        ).json()["inversions"][0]["inversion_id"]
+        == inversion_id
+    )
 
 
 # --------------------------------------------------------------------------- #

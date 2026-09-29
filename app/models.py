@@ -384,11 +384,15 @@ class StationAuditResult(Base):
 # azimuth/takeoff through the run's layered velocity model, grid-searches
 # double-couple (strike, dip, rake) on a 10-degree grid and keeps every
 # mechanism whose weighted polarity misfit equals the minimum (a nodal --
-# zero-amplitude -- prediction counts as a misfit).  Mechanisms equivalent
-# under swapping the two nodal planes are deduplicated; each surviving
-# solution reports both planes, its misfit weight and the per-station
-# observed/predicted polarities.  Like the catalog and the station audit this
-# layer never modifies ingestions/runs/events/picks or catalog content.
+# zero-amplitude -- prediction counts as a misfit).  Only mechanisms identical
+# under swapping the two nodal planes are deduplicated; the globally sign-
+# flipped tensor -M predicts opposite polarities and stays a separate
+# candidate.  Reports built by the earlier sign-merging rule (schema_version
+# 1) are repaired lazily in place to schema version 2 on their next request or
+# query; each surviving solution reports both planes, its misfit weight and the
+# per-station observed/predicted polarities.  Like the catalog and the station
+# audit this layer never modifies ingestions/runs/events/picks or catalog
+# content.
 # --------------------------------------------------------------------------- #
 class FocalMechanismInversion(Base):
     """One idempotent first-motion inversion bound to an event/model/polarity set."""
@@ -409,6 +413,10 @@ class FocalMechanismInversion(Base):
     station_count = Column(Integer, nullable=False)
     solution_count = Column(Integer, nullable=False)
     min_misfit_weight = Column(Float, nullable=False)
+    # Dedup-rule version of the persisted solutions: 1 = legacy report whose
+    # key merged M with -M (repaired lazily to 2 in place); 2 = current rule
+    # (only nodal-plane swaps are merged; M and -M stay distinct candidates).
+    schema_version = Column(Integer, nullable=False, default=2)
     created_at = Column(DateTime, nullable=False, default=_utcnow)
 
     __table_args__ = (

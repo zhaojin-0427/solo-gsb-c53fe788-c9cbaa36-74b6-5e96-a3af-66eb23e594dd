@@ -1,7 +1,7 @@
 """Database engine / session management."""
 from __future__ import annotations
 
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from . import config
@@ -29,6 +29,37 @@ if _is_sqlite:
 
 class Base(DeclarativeBase):
     pass
+
+
+def run_migrations() -> None:
+    """Idempotent lightweight migrations for columns added after first release.
+
+    ``Base.metadata.create_all`` only creates missing tables, so columns added
+    to existing tables are brought in here with portable DDL; rows created
+    before a column existed are backfilled to the legacy value and never
+    touched again.
+    """
+    inspector = inspect(engine)
+    if "focal_mechanism_inversions" not in inspector.get_table_names():
+        return  # fresh database: create_all builds the table with the new column
+    columns = {c["name"] for c in inspector.get_columns("focal_mechanism_inversions")}
+    with engine.begin() as conn:
+        if "schema_version" not in columns:
+            # Reports already stored were produced under the sign-merging
+            # dedup rule, so they start at schema version 1; the service
+            # repairs them lazily to 2 on their next request/query.
+            conn.execute(
+                text(
+                    "ALTER TABLE focal_mechanism_inversions "
+                    "ADD COLUMN schema_version INTEGER"
+                )
+            )
+            conn.execute(
+                text(
+                    "UPDATE focal_mechanism_inversions SET schema_version = 1 "
+                    "WHERE schema_version IS NULL"
+                )
+            )
 
 
 def get_db():
