@@ -406,6 +406,12 @@ class FocalMechanismInversion(Base):
     # normalized polarity set and per-station ray geometry (azimuth/takeoff).
     frozen = Column(JSON, nullable=False)
     grid_step_deg = Column(Float, nullable=False)
+    # Dedup rule used to produce ``solutions``: 1 = legacy release (canonical
+    # key sign-canonicalized the moment tensor, wrongly merging M with -M);
+    # 2 = corrected rule (plane-swap only, slip-reversed mechanisms retained).
+    # Legacy rows are lazily repaired (and bumped to 2) on repeat submission or
+    # any fetch, without changing the id/request hash/frozen context.
+    dedup_rule_version = Column(Integer, nullable=False, default=2)
     station_count = Column(Integer, nullable=False)
     solution_count = Column(Integer, nullable=False)
     min_misfit_weight = Column(Float, nullable=False)

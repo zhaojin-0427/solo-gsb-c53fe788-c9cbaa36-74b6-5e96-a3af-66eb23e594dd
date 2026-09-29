@@ -1,7 +1,7 @@
 """Database engine / session management."""
 from __future__ import annotations
 
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from . import config
@@ -29,6 +29,35 @@ if _is_sqlite:
 
 class Base(DeclarativeBase):
     pass
+
+
+def run_lightweight_migrations(bind=None) -> None:
+    """Schema evolutions for deployments whose tables predate a new column.
+
+    ``create_all`` never alters existing tables, so additions are applied
+    here.  The focal-mechanism dedup-rule marker is added with default 1
+    (legacy rule), so every already-persisted report is flagged for lazy
+    repair on the next repeat submission or fetch by id; brand-new tables
+    are created by the ORM metadata with a Python default of 2.
+    """
+    bind = bind or engine
+    inspector = inspect(bind)
+    if "focal_mechanism_inversions" not in inspector.get_table_names():
+        return  # created from scratch with all current columns
+    columns = {c["name"] for c in inspector.get_columns("focal_mechanism_inversions")}
+    if "dedup_rule_version" in columns:
+        return
+    with bind.begin() as conn:
+        # The column is added with default 1: every already-persisted row is a
+        # legacy (M == -M) report that needs lazy repair.  Fresh tables are
+        # created by the ORM metadata with server_default 2 instead.
+        conn.execute(
+            text(
+                "ALTER TABLE focal_mechanism_inversions "
+                "ADD COLUMN dedup_rule_version INTEGER "
+                "NOT NULL DEFAULT 1"
+            )
+        )
 
 
 def get_db():

@@ -8,13 +8,14 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from .api.routes import router
-from .database import Base, SessionLocal, engine
+from .database import Base, SessionLocal, engine, run_lightweight_migrations
 from .services.pipeline import ApiError, seed_default_model
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
+    run_lightweight_migrations(engine)
     db = SessionLocal()
     try:
         seed_default_model(db)
@@ -25,7 +26,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Seismic Network Phase Association API",
-    version="1.5.0",
+    version="1.6.0",
     description=(
         "Upload miniSEED waveform windows, generate STA/LTA candidate picks, "
         "associate them into events and locate them with weighted least squares "
@@ -44,7 +45,8 @@ app = FastAPI(
         "P-wave first-motion focal mechanism inversion grid-searches "
         "double-couple strike/dip/rake on a 10-degree grid for a completed "
         "event's associated P polarities, keeping every minimum-misfit "
-        "mechanism with plane-swap duplicates removed."
+        "mechanism with plane-swap duplicates removed but the "
+        "slip-reversed (-M) mechanism retained as a separate candidate."
     ),
     lifespan=lifespan,
 )
@@ -81,7 +83,7 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
 def root():
     return {
         "service": "seismic-network-association",
-        "version": "1.5.0",
+        "version": "1.6.0",
         "docs": "/docs",
         "health": "/health",
     }

@@ -142,6 +142,9 @@ def client(tmp_path):
     from app.database import Base
 
     Base.metadata.create_all(bind=test_engine)
+    from app.database import run_lightweight_migrations
+
+    run_lightweight_migrations(test_engine)
     from fastapi.testclient import TestClient
 
     from app.main import app
